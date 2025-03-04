@@ -28,14 +28,18 @@ load_dotenv()
 # Create Flask app
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False  # Preserve key order in JSON responses
+app.debug = os.getenv("DEBUG", "False").lower() in ('true', '1', 't')
 
 # Setup authentication
 auth = HTTPBasicAuth()
 
 # Setup security
-Talisman(app, content_security_policy={
-    'default-src': ['\'self\'']
-})
+# In development
+if app.debug:
+    Talisman(app, content_security_policy=None)
+else:
+    # Production CSP
+    Talisman(app, content_security_policy={'default-src': ['\'self\'']})
 
 # Get credentials from environment variables
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
@@ -190,5 +194,4 @@ if __name__ == '__main__':
     run_scheduler()
     update_exchange_rates()
     port = int(os.getenv("PORT", 5001))
-    debug = os.getenv("DEBUG", "False").lower() in ('true', '1', 't')
-    app.run(debug=debug, use_reloader=False, host='0.0.0.0', port=port)
+    app.run(use_reloader=False, host='0.0.0.0', port=port)
