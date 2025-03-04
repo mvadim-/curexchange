@@ -159,15 +159,27 @@ def api_get_supported_currencies():
 
 
 def run_scheduler() -> None:
-    """Setup and start the background scheduler for regular updates"""
+    """Setup and start the background scheduler for regular updates.
+    Updates will only run on weekdays (Monday to Friday) between 8:00 and 20:00."""
     try:
         # Setup the scheduler to update exchange rates every 15 minutes
         scheduler = BackgroundScheduler(timezone=pytz.timezone("Europe/Kiev"))
-        scheduler.add_job(func=update_exchange_rates, trigger="interval", minutes=15)
+
+        # Create a job that runs only on weekdays (Monday=0 to Friday=4) between 8:00 and 20:00
+        scheduler.add_job(
+            func=update_exchange_rates,
+            trigger="cron",
+            day_of_week="mon-fri",  # Monday to Friday
+            hour="8-19",  # 8:00 to 19:45 (last run before 20:00)
+            minute="*/15",  # Every 15 minutes
+            id="exchange_rates_updater"
+        )
+
         scheduler.start()
 
         if scheduler.running:
-            logger.info("Scheduler started successfully.")
+            logger.info(
+                "Scheduler started successfully. Exchange rates will update every 15 minutes on weekdays between 8:00 and 20:00.")
             # Register shutdown handler
             atexit.register(lambda: scheduler.shutdown())
         else:
