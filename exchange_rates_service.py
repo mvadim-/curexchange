@@ -377,13 +377,15 @@ def get_exchange_rates_for_period(selected_currency: str, period_days: int) -> D
     client = None
     try:
         tz = pytz.timezone("Europe/Kiev")
-        cutoff_datetime = datetime.datetime.now(tz) - datetime.timedelta(days=period_days)
+        current_datetime = datetime.datetime.now(tz)
+        cutoff_datetime = current_datetime - datetime.timedelta(days=period_days)
         cutoff_iso = cutoff_datetime.isoformat()
 
         client = get_mongodb_client()
         db = client[DB_NAME]
         collection = db[COLLECTION_NAME]
 
+        # Get all documents for the period
         docs = list(collection.find({"timestamp": {"$gte": cutoff_iso}}).sort("timestamp", 1))
 
         result = {
@@ -392,7 +394,52 @@ def get_exchange_rates_for_period(selected_currency: str, period_days: int) -> D
             "data": []
         }
 
-        for doc in docs:
+        # Different sampling strategies based on period_days
+        if period_days == 1:
+            # For 1 day period: return rates during working hours (8:00 to 20:00) once per hour
+            # Group documents by hour
+            hour_groups = {}
+            for doc in docs:
+                timestamp = doc.get("timestamp")
+                doc_datetime = datetime.datetime.fromisoformat(timestamp)
+
+                # Check if it's within working hours (8:00 - 20:00)
+                if 8 <= doc_datetime.hour < 20:
+                    # Key by hour to get one sample per hour
+                    hour_key = doc_datetime.strftime("%Y-%m-%d %H")
+
+                    # Keep only the first document for each hour
+                    if hour_key not in hour_groups:
+                        hour_groups[hour_key] = doc
+
+            # Use these documents for the result
+            filtered_docs = list(hour_groups.values())
+            filtered_docs.sort(key=lambda x: x.get("timestamp"))  # Ensure chronological order
+        else:
+            # For other periods: one sample per day (closest to 18:00)
+            # Group documents by day
+            day_groups = {}
+            for doc in docs:
+                timestamp = doc.get("timestamp")
+                doc_datetime = datetime.datetime.fromisoformat(timestamp)
+                day_key = doc_datetime.strftime("%Y-%m-%d")
+
+                # For each day, find the document closest to 18:00
+                target_time = 18  # 18:00
+
+                if day_key not in day_groups:
+                    day_groups[day_key] = {"doc": doc, "time_diff": abs(doc_datetime.hour - target_time)}
+                else:
+                    time_diff = abs(doc_datetime.hour - target_time)
+                    if time_diff < day_groups[day_key]["time_diff"]:
+                        day_groups[day_key] = {"doc": doc, "time_diff": time_diff}
+
+            # Extract just the documents
+            filtered_docs = [item["doc"] for item in day_groups.values()]
+            filtered_docs.sort(key=lambda x: x.get("timestamp"))  # Ensure chronological order
+
+        # Process the filtered documents
+        for doc in filtered_docs:
             timestamp = doc.get("timestamp")
             banks_data = {}
 
