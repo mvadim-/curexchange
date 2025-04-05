@@ -4,14 +4,11 @@ import html
 import datetime
 import os
 from bs4 import BeautifulSoup
-from pymongo import errors
-from pymongo.mongo_client import MongoClient
-from pymongo.server_api import ServerApi
 import pytz
-import sys
 from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
 import logging
+from mongo_repository import MongoRepository
 
 # Configure logging
 logging.basicConfig(
@@ -33,6 +30,9 @@ BESTOBMIN_URL = "https://bestobmin.com.ua"
 MONGO_URI = os.getenv("MONGO_URI", "")
 DB_NAME = os.getenv("DB_NAME", "currency_db")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "exchange_rates")
+
+# Initialize MongoDB repository
+mongo_repo = MongoRepository(MONGO_URI, DB_NAME, COLLECTION_NAME)
 
 # Type definitions for better code readability
 RateData = Dict[str, Any]
@@ -237,60 +237,6 @@ def normalize_privatbank_rates(raw_rates: List[Dict[str, Any]]) -> NormalizedRat
     return normalized
 
 
-def get_mongodb_client() -> MongoClient:
-    """
-    Get a MongoDB client connection.
-
-    Returns:
-        MongoDB client instance
-
-    Raises:
-        SystemExit: If the MongoDB URI is invalid or connection fails
-    """
-    if not MONGO_URI:
-        logger.error("MongoDB URI is not set. Please check environment variables.")
-        sys.exit(1)
-
-    try:
-        return MongoClient(MONGO_URI, server_api=ServerApi('1'))
-    except errors.ConfigurationError as e:
-        logger.error(f"MongoDB configuration error: {e}")
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"Error connecting to MongoDB: {e}")
-        sys.exit(1)
-
-
-def save_to_mongodb(timestamp: str, normalized_data: Dict[str, List[Dict[str, Any]]]) -> None:
-    """
-    Save exchange rate data to MongoDB.
-
-    Args:
-        timestamp: ISO format timestamp
-        normalized_data: Dictionary with normalized exchange rate data
-    """
-    client = None
-    try:
-        client = get_mongodb_client()
-        db = client[DB_NAME]
-        collection = db[COLLECTION_NAME]
-
-        document = {
-            "timestamp": timestamp,
-            "Raiffeisen": normalized_data.get("Raiffeisen", []),
-            "PrivatBank": normalized_data.get("PrivatBank", []),
-            "Bestobmin": normalized_data.get("Bestobmin", [])
-        }
-
-        result = collection.insert_one(document)
-        logger.info(f"Data saved to MongoDB with document id: {result.inserted_id}")
-    except Exception as e:
-        logger.error(f"Error saving data to MongoDB: {e}")
-    finally:
-        if client:
-            client.close()
-
-
 def update_exchange_rates() -> Dict[str, Any]:
     """
     Update exchange rates from all sources and save to database.
@@ -312,8 +258,12 @@ def update_exchange_rates() -> Dict[str, Any]:
             "Bestobmin": raw_bestobmin
         }
 
-        save_to_mongodb(current_timestamp, normalized_data)
-        logger.info(f"Exchange rates updated at {current_timestamp}")
+        # Use the repository to save data
+        success = mongo_repo.save_exchange_rates(current_timestamp, normalized_data)
+        if success:
+            logger.info(f"Exchange rates updated at {current_timestamp}")
+        else:
+            logger.warning("Failed to save exchange rates to database")
 
         return {
             "timestamp": current_timestamp,
@@ -338,29 +288,7 @@ def get_exchange_rates_by_currency(selected_currency: str) -> Dict[str, Any]:
     Returns:
         Dictionary with the latest exchange rates for the selected currency
     """
-    client = None
-    try:
-        client = get_mongodb_client()
-        db = client[DB_NAME]
-        collection = db[COLLECTION_NAME]
-
-        latest_doc = collection.find_one(sort=[("timestamp", -1)])
-        if not latest_doc:
-            logger.warning(f"No exchange rate data found for {selected_currency}")
-            return {}
-
-        filtered_data = {"timestamp": latest_doc.get("timestamp")}
-        for bank in ["Raiffeisen", "PrivatBank", "Bestobmin"]:
-            bank_rates = latest_doc.get(bank, [])
-            filtered_data[bank] = [rate for rate in bank_rates if rate.get("currency") == selected_currency]
-
-        return filtered_data
-    except Exception as e:
-        logger.error(f"Error retrieving exchange rates for {selected_currency}: {e}")
-        return {}
-    finally:
-        if client:
-            client.close()
+    return mongo_repo.get_latest_exchange_rates(selected_currency)
 
 
 def get_exchange_rates_for_period(selected_currency: str, period_days: int) -> Dict[str, Any]:
@@ -374,96 +302,9 @@ def get_exchange_rates_for_period(selected_currency: str, period_days: int) -> D
     Returns:
         Dictionary with exchange rate data over the specified period
     """
-    client = None
-    try:
-        tz = pytz.timezone("Europe/Kiev")
-        current_datetime = datetime.datetime.now(tz)
-        cutoff_datetime = current_datetime - datetime.timedelta(days=period_days)
-        cutoff_iso = cutoff_datetime.isoformat()
+    tz = pytz.timezone("Europe/Kiev")
+    current_datetime = datetime.datetime.now(tz)
+    cutoff_datetime = current_datetime - datetime.timedelta(days=period_days)
+    cutoff_iso = cutoff_datetime.isoformat()
 
-        client = get_mongodb_client()
-        db = client[DB_NAME]
-        collection = db[COLLECTION_NAME]
-
-        # Get all documents for the period
-        docs = list(collection.find({"timestamp": {"$gte": cutoff_iso}}).sort("timestamp", 1))
-
-        result = {
-            "currency": selected_currency,
-            "period_days": period_days,
-            "data": []
-        }
-
-        # Different sampling strategies based on period_days
-        if period_days == 1:
-            # For 1 day period: return rates during working hours (8:00 to 20:00) once per hour
-            # Group documents by hour
-            hour_groups = {}
-            for doc in docs:
-                timestamp = doc.get("timestamp")
-                doc_datetime = datetime.datetime.fromisoformat(timestamp)
-
-                # Check if it's within working hours (8:00 - 20:00)
-                if 8 <= doc_datetime.hour < 20:
-                    # Key by hour to get one sample per hour
-                    hour_key = doc_datetime.strftime("%Y-%m-%d %H")
-
-                    # Keep only the first document for each hour
-                    if hour_key not in hour_groups:
-                        hour_groups[hour_key] = doc
-
-            # Use these documents for the result
-            filtered_docs = list(hour_groups.values())
-            filtered_docs.sort(key=lambda x: x.get("timestamp"))  # Ensure chronological order
-        else:
-            # For other periods: one sample per day (closest to 18:00)
-            # Group documents by day
-            day_groups = {}
-            for doc in docs:
-                timestamp = doc.get("timestamp")
-                doc_datetime = datetime.datetime.fromisoformat(timestamp)
-                day_key = doc_datetime.strftime("%Y-%m-%d")
-
-                # For each day, find the document closest to 18:00
-                target_time = 18  # 18:00
-
-                if day_key not in day_groups:
-                    day_groups[day_key] = {"doc": doc, "time_diff": abs(doc_datetime.hour - target_time)}
-                else:
-                    time_diff = abs(doc_datetime.hour - target_time)
-                    if time_diff < day_groups[day_key]["time_diff"]:
-                        day_groups[day_key] = {"doc": doc, "time_diff": time_diff}
-
-            # Extract just the documents
-            filtered_docs = [item["doc"] for item in day_groups.values()]
-            filtered_docs.sort(key=lambda x: x.get("timestamp"))  # Ensure chronological order
-
-        # Process the filtered documents
-        for doc in filtered_docs:
-            timestamp = doc.get("timestamp")
-            banks_data = {}
-
-            for bank in ["Raiffeisen", "PrivatBank", "Bestobmin"]:
-                bank_rates = doc.get(bank, [])
-                filtered_rates = [rate for rate in bank_rates if rate.get("currency") == selected_currency]
-                if filtered_rates:
-                    banks_data[bank] = filtered_rates
-
-            if banks_data:
-                result["data"].append({
-                    "timestamp": timestamp,
-                    "rates": banks_data
-                })
-
-        return result
-    except Exception as e:
-        logger.error(f"Error retrieving exchange rates for period {period_days} days: {e}")
-        return {
-            "currency": selected_currency,
-            "period_days": period_days,
-            "error": str(e),
-            "data": []
-        }
-    finally:
-        if client:
-            client.close()
+    return mongo_repo.get_exchange_rates_for_period(selected_currency, period_days, cutoff_iso)
