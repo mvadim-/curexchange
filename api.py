@@ -163,7 +163,7 @@ def run_scheduler() -> None:
     Updates will only run on weekdays (Monday to Friday) between 8:00 and 20:00."""
     try:
         # Setup the scheduler to update exchange rates every 15 minutes
-        scheduler = BackgroundScheduler(timezone=pytz.timezone("Europe/Kiev"))
+        scheduler = BackgroundScheduler(timezone=pytz.timezone("Europe/Kyiv"))
 
         # Create a job that runs only on weekdays (Monday=0 to Friday=4) between 8:00 and 20:00
         scheduler.add_job(
